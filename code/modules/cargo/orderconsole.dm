@@ -7,7 +7,7 @@
 
 	///Can the supply console send the shuttle back and forth? Used in the UI backend.
 	var/can_send = TRUE
-	///Can this console only send requests?
+	///Can this console only send requests? Typically used at the cargo front desk for pedestrians.
 	var/requestonly = FALSE
 	///Can you approve requests placed for cargo? Works differently between the app and the computer.
 	var/can_approve_requests = TRUE
@@ -17,8 +17,6 @@
 		human remains, classified nuclear weaponry, mail, undelivered departmental order crates, syndicate bombs, \
 		homing beacons, unstable eigenstates, fax machines, or machinery housing any form of artificial intelligence."
 	var/blockade_warning = "Bluespace instability detected. Shuttle movement impossible."
-	/// radio used by the console to send messages on supply channel
-	var/obj/item/radio/headset/radio
 	/// var that tracks message cooldown
 	var/message_cooldown
 	var/list/loaded_coupons
@@ -46,21 +44,12 @@
 	can_approve_requests = FALSE
 	requestonly = TRUE
 
-/obj/machinery/computer/cargo/Initialize(mapload)
-	. = ..()
-	radio = new /obj/item/radio/headset/headset_cargo(src)
-
-/obj/machinery/computer/cargo/Destroy()
-	QDEL_NULL(radio)
-	return ..()
-
-/obj/machinery/computer/cargo/attacked_by(obj/item/I, mob/living/user)
-	if(istype(I,/obj/item/trade_chip))
-		var/obj/item/trade_chip/contract = I
-		contract.try_to_unlock_contract(user)
-		return TRUE
-	else
-		return ..()
+/obj/machinery/computer/cargo/item_interaction(mob/living/user, obj/item/tool, list/modifiers)
+	if(!istype(tool, /obj/item/trade_chip))
+		return NONE
+	var/obj/item/trade_chip/contract = tool
+	contract.try_to_unlock_contract(user)
+	return ITEM_INTERACT_SUCCESS
 
 /obj/machinery/computer/cargo/emag_act(mob/user, obj/item/card/emag/emag_card)
 	if(obj_flags & EMAGGED)
@@ -106,6 +95,7 @@
 	data["loan_dispatched"] = SSshuttle.shuttle_loan && SSshuttle.shuttle_loan.dispatched
 	data["can_send"] = can_send
 	data["can_approve_requests"] = can_approve_requests
+	data["requestonly"] = requestonly
 	var/message = "Remember to stamp and send back the supply manifests."
 	if(SSshuttle.centcom_message)
 		message = SSshuttle.centcom_message
@@ -113,11 +103,9 @@
 		message = blockade_warning
 	data["message"] = message
 
-	var/list/amount_by_name = list()
 	var/cart_list = list()
 	for(var/datum/supply_order/order in SSshuttle.shopping_list)
 		if(cart_list[order.pack.name])
-			amount_by_name[order.pack.name] += 1
 			cart_list[order.pack.name][1]["amount"]++
 			cart_list[order.pack.name][1]["cost"] += order.get_final_cost()
 			if(order.department_destination)
@@ -126,7 +114,6 @@
 				cart_list[order.pack.name][1]["paid"]++
 			continue
 
-		amount_by_name[order.pack.name] += 1
 		cart_list[order.pack.name] = list(list(
 			"cost_type" = order.cost_type,
 			"object" = order.pack.name,
@@ -134,8 +121,8 @@
 			"id" = order.id,
 			"amount" = 1,
 			"orderer" = order.orderer,
-			"paid" = !isnull(order.paying_account) ? 1 : 0, //number of orders purchased privatly
-			"dep_order" = order.department_destination ? 1 : 0, //number of orders purchased by a department
+			"paid" = !!order.paying_account?.add_to_accounts, //number of orders purchased privatly
+			"dep_order" = !!order.department_destination, //number of orders purchased by a department
 			"can_be_cancelled" = order.can_be_cancelled,
 		))
 	data["cart"] = list()
@@ -146,15 +133,14 @@
 	data["requests"] = list()
 	for(var/datum/supply_order/order in SSshuttle.request_list)
 		var/datum/supply_pack/pack = order.pack
-		amount_by_name[pack.name] += 1
 		data["requests"] += list(list(
 			"object" = pack.name,
 			"cost" = pack.get_cost(),
 			"orderer" = order.orderer,
 			"reason" = order.reason,
 			"id" = order.id,
+			"account" = order.paying_account ? order.paying_account.account_holder : "Cargo Department"
 		))
-	data["amount_by_name"] = amount_by_name
 
 	return data
 
@@ -206,26 +192,10 @@
 			"goody" = pack.goody,
 			"access" = pack.access,
 			"contraband" = pack.contraband,
-			"contains" = get_pack_contains(pack),
+			"contains" = pack.get_contents_ui_data(),
 		))
 
 	return packs
-
-/**
- * returns a list of the contents of a supply pack
- * * pack - the pack to get the contents of
- */
-/obj/machinery/computer/cargo/proc/get_pack_contains(datum/supply_pack/pack)
-	var/list/contains = list()
-	for(var/obj/item/item as anything in pack.contains)
-		contains += list(list(
-			"name" = item.name,
-			"icon" = item.greyscale_config ? null : item.icon,
-			"icon_state" = item.greyscale_config ? null : item.icon_state,
-			"amount" = pack.contains[item]
-		))
-
-	return contains
 
 /**
  * returns the discount multiplier applied to all supply packs,
@@ -264,32 +234,44 @@
 		rank = "Silicon"
 
 	var/datum/bank_account/account
-	if(self_paid && isliving(user))
+	if(isliving(user))
 		var/mob/living/living_user = user
 		var/obj/item/card/id/id_card = living_user.get_idcard(TRUE)
-		if(!istype(id_card))
-			say("No ID card detected.")
-			return
-		if(IS_DEPARTMENTAL_CARD(id_card))
-			say("The [src] rejects [id_card].")
-			return
-		account = id_card.registered_account
-		if(!istype(account))
-			say("Invalid bank account.")
-			return
-		var/list/access = id_card.GetAccess()
-		if(pack.access_view && !(pack.access_view in access))
-			say("[id_card] lacks the requisite access for this purchase.")
-			return
+		account = id_card?.registered_account // We can still assign an account for request department purposes.
+		if(self_paid)
+			if(!istype(id_card))
+				say("No ID card detected.")
+				return
+			if(IS_DEPARTMENTAL_CARD(id_card))
+				say("The [src] rejects [id_card].")
+				return
+			if(!istype(account))
+				say("Invalid bank account.")
+				return
+			var/list/access = id_card.GetAccess()
+			if(pack.access_view && !(pack.access_view in access))
+				say("[id_card] lacks the requisite access for this purchase.")
+				return
 
 	// The list we are operating on right now
 	var/list/working_list = SSshuttle.shopping_list
 	var/reason = ""
-	if(requestonly && !self_paid)
+	var/datum/bank_account/personal_department
+	if(requestonly && !self_paid && !pack.goody)
 		working_list = SSshuttle.request_list
 		reason = tgui_input_text(user, "Reason", name, max_length = MAX_MESSAGE_LEN)
 		if(isnull(reason))
 			return
+
+		name = account?.account_holder
+		if(account?.account_job)
+			personal_department = SSeconomy.get_dep_account(account.account_job.paycheck_department)
+			if(!(personal_department.account_holder == "Cargo Budget"))
+				var/dept_choice = tgui_alert(user, "Which department are you requesting this for?", "Choose department to request from", list("Cargo Budget", "[personal_department.account_holder]"))
+				if(!dept_choice)
+					return
+				if(dept_choice == "Cargo Budget")
+					personal_department = SSeconomy.get_dep_account(cargo_account)
 
 	if(pack.goody && !self_paid)
 		playsound(src, 'sound/machines/buzz/buzz-sigh.ogg', 50, FALSE)
@@ -301,6 +283,9 @@
 		playsound(src, 'sound/machines/buzz/buzz-sigh.ogg', 50, FALSE)
 		say("ERROR: No more then [CARGO_MAX_ORDER] of any pack may be ordered at once")
 		return
+
+	if(!self_paid)
+		account = personal_department
 
 	amount = clamp(amount, 1, CARGO_MAX_ORDER - similar_count)
 	for(var/count in 1 to amount)
@@ -319,15 +304,14 @@
 			orderer_ckey = ckey,
 			reason = reason,
 			paying_account = account,
-			coupon = applied_coupon,
+			coupon = applied_coupon
 		)
 		working_list += order
 
 	if(self_paid)
 		say("Order processed. The price will be charged to [account.account_holder]'s bank account on delivery.")
 	if(requestonly && message_cooldown < world.time)
-		var/message = amount == 1 ? "A new order has been requested." : "[amount] order has been requested."
-		radio.talk_into(src, message, RADIO_CHANNEL_SUPPLY)
+		aas_config_announce(/datum/aas_config_entry/cargo_orders_announcement, list("AMOUNT" = amount), src, list(RADIO_CHANNEL_SUPPLY), amount == 1 ? "Single Order" : "Multiple Orders")
 		message_cooldown = world.time + 30 SECONDS
 	. = TRUE
 
@@ -405,7 +389,7 @@
 					requisition_paper.update_appearance()
 
 				ui.user.investigate_log("called the supply shuttle.", INVESTIGATE_CARGO)
-				say("The supply shuttle has been called and will arrive in [SSshuttle.supply.timeLeft(600)] minutes.")
+				say("The supply shuttle has been called and will arrive in [SSshuttle.supply.timeLeft(600)] minute\s.")
 				SSshuttle.moveShuttle(cargo_shuttle, docking_home, TRUE)
 
 			. = TRUE
@@ -502,3 +486,13 @@
 
 	var/datum/signal/status_signal = new(list("command" = command))
 	frequency.post_signal(src, status_signal)
+
+/datum/aas_config_entry/cargo_orders_announcement
+	name = "Cargo Alert: New Orders"
+	announcement_lines_map = list(
+		"Single Order" = "A new order has been requested.",
+		"Multiple Orders" = "%AMOUNT orders have been requested.",
+	)
+	vars_and_tooltips_map = list(
+		"AMOUNT" = "will be replaced wuth number of orders.",
+	)
